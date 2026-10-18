@@ -15,7 +15,10 @@
 #include "emulation_gl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <vector>
 
@@ -49,6 +52,19 @@ namespace gfxstream {
 namespace host {
 namespace gl {
 namespace {
+
+// Ownership evidence only; never changes cleanup or holds an extra context reference.
+void traceContextOwner(const char* event, uint64_t puid, HandleType handle,
+                       HandleType shared, EGLContext egl, size_t references) {
+    const char* setting = std::getenv("AEMU_RESOURCE_TRACE");
+    if (!setting || std::strcmp(setting, "1")) return;
+    static std::atomic<unsigned> emitted{0};
+    if (emitted.fetch_add(1, std::memory_order_relaxed) >= 2048) return;
+    std::fprintf(stderr, "AEMU_RESOURCE context_owner event=%s puid=%llu handle=%u shared=%u egl=%p references=%zu\n",
+                 event, (unsigned long long)puid, (unsigned)handle, (unsigned)shared,
+                 (void*)egl, references);
+    std::fflush(stderr);
+}
 
 std::optional<GfxstreamFormat> GetGfxstreamFormat(const FeatureSet& features,
                                                   FrameworkFormat format) {
@@ -1002,7 +1018,12 @@ HandleType EmulationGl::createEmulatedEglContext(uint32_t emulatedConfigIndex,
     uint64_t puid = tinfo->m_puid;
     if (puid) {
         mProcOwnedEmulatedEglContexts[puid].insert(handle);
+    } else {
+        // Legacy/no-PUID contexts still need cleanup when their render thread exits.
+        tinfo->m_contextSet.insert(handle);
     }
+    traceContextOwner("create", puid, handle, shareContextHandle,
+                      mContexts[handle]->getEGLContext(), mContexts[handle].use_count());
     return handle;
 }
 
@@ -1013,6 +1034,9 @@ void EmulationGl::destroyEmulatedEglContext(HandleType contextHandle) {
         GFXSTREAM_ERROR("Failed to find EmulatedEglContext:%d", contextHandle);
         return;
     }
+    const auto* traceInfo = RenderThreadInfoGl::get();
+    traceContextOwner("explicit_destroy", traceInfo ? traceInfo->m_puid : 0,
+                      contextHandle, 0, it->second->getEGLContext(), it->second.use_count());
     mContexts.erase(it);
 
     RenderThreadInfoGl* tinfo = RenderThreadInfoGl::get();
@@ -1328,6 +1352,13 @@ HandleType EmulationGl::getWindowSurfaceColorBufferHandle(HandleType surfaceHand
 std::vector<HandleType> EmulationGl::cleanupProcGLObjects(uint64_t puid) {
     RecursiveScopedContextBind bind(getColorBufferContextHelper());
     std::vector<HandleType> colorBuffersToCleanUp;
+    const char* traceEnv = std::getenv("AEMU_RESOURCE_TRACE");
+    const bool trace = traceEnv && !std::strcmp(traceEnv, "1");
+    if (trace) {
+        std::fprintf(stderr, "AEMU_RESOURCE gl_cleanup_before puid=%llu contexts=%zu windows=%zu images=%zu\n",
+                     (unsigned long long)puid, mContexts.size(), mWindows.size(), mImages.size());
+        std::fflush(stderr);
+    }
 
     // Clean up window surfaces
     auto procWindowsIt = mProcOwnedEmulatedEglWindowSurfaces.find(puid);
@@ -1348,6 +1379,11 @@ std::vector<HandleType> EmulationGl::cleanupProcGLObjects(uint64_t puid) {
     auto procContextsIt = mProcOwnedEmulatedEglContexts.find(puid);
     if (procContextsIt != mProcOwnedEmulatedEglContexts.end()) {
         for (auto ctx : procContextsIt->second) {
+            auto found = mContexts.find(ctx);
+            if (found != mContexts.end()) {
+                traceContextOwner("process_cleanup", puid, ctx, 0,
+                                  found->second->getEGLContext(), found->second.use_count());
+            }
             mContexts.erase(ctx);
         }
         mProcOwnedEmulatedEglContexts.erase(procContextsIt);
@@ -1360,6 +1396,11 @@ std::vector<HandleType> EmulationGl::cleanupProcGLObjects(uint64_t puid) {
             mImages.erase(image);
         }
         mProcOwnedEmulatedEglImages.erase(procImagesIt);
+    }
+    if (trace) {
+        std::fprintf(stderr, "AEMU_RESOURCE gl_cleanup_after puid=%llu contexts=%zu windows=%zu images=%zu\n",
+                     (unsigned long long)puid, mContexts.size(), mWindows.size(), mImages.size());
+        std::fflush(stderr);
     }
     return colorBuffersToCleanUp;
 }

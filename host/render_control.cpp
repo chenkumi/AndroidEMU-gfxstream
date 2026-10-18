@@ -1235,6 +1235,11 @@ static void rcSetPuid(uint64_t puid) {
 
     RenderThreadInfo *tInfo = RenderThreadInfo::get();
     tInfo->m_puid = puid;
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (tInfo->m_glInfo) {
+        tInfo->m_glInfo->m_puid = puid;
+    }
+#endif
     auto* renderThreadInfoVk = vk::RenderThreadInfoVk::get();
     if (renderThreadInfoVk) {
         renderThreadInfoVk->ctx_id = puid;

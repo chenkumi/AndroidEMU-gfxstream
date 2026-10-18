@@ -21,6 +21,7 @@
 #include "thread_info.h"
 
 #include <common/gles_context.h>
+#include <common/lifetime_trace.h>
 #include <memory>
 
 unsigned int EglContext::s_nextContextHndl = 0;
@@ -96,10 +97,18 @@ EglContext::EglContext(EglDisplay *dpy,
     } else {
         m_hndl = 0;
     }
+    aemu_lifetime_trace::created(aemu_lifetime_trace::kEglContext);
+    aemu_lifetime_trace::snapshot("egl_context_created", this);
+    if (aemu_lifetime_trace::identityEventAllowed()) {
+        std::fprintf(stderr, "AEMU_RESOURCE egl_identity event=create handle=%u context=%p native=%p group=%p\n",
+                     m_hndl, this, m_native.get(), m_shareGroup.get());
+        std::fflush(stderr);
+    }
 }
 
 EglContext::~EglContext()
 {
+    aemu_lifetime_trace::snapshot("egl_context_destroy_begin", this);
     ThreadInfo* thread = getThreadInfo();
     // get the current context
     EglContext* rebindCtx = thread->eglContext.get();
@@ -160,6 +169,8 @@ EglContext::~EglContext()
     } else {
         m_dpy->nativeType()->makeCurrent(nullptr, nullptr, nullptr);
     }
+    aemu_lifetime_trace::destroyed(aemu_lifetime_trace::kEglContext);
+    aemu_lifetime_trace::snapshot("egl_context_destroy_done", this);
 }
 
 void EglContext::setSurfaces(SurfacePtr read,SurfacePtr draw)

@@ -36,7 +36,9 @@ namespace gl {
 // on the CPU.
 
 // Usage:
-// 0. Have a current OpenGL context working.
+// 0. Have a compatible OpenGL context current for use and destruction.
+//    Do not externally bind this converter's private program or quad buffers:
+//    reinitialization can delete them, so saved caller bindings must be independent.
 // 1. Constructing the YUVConverter object will allocate
 //    OpenGL resources needed to convert, given the desired
 //    |width| and |height| of the buffer.
@@ -68,6 +70,9 @@ class YUVConverter {
     // if size mismatches, will read nothing.
     void readPixels(uint8_t* pixels, uint32_t pixels_size);
 
+    // Exchange ownership of valid, same-format plane sets with the caller.
+    // Incoming names become converter-owned; outgoing names become caller-owned.
+    // Ownership must be disjoint. Interleaved U/V share one chroma object.
     void swapTextures(GfxstreamFormat format, GLuint* textures, void* metadata = nullptr);
 
     // public so other classes can call
@@ -80,6 +85,8 @@ class YUVConverter {
 private:
     void init(int w, int h, GfxstreamFormat format);
     void reset();
+    // Conversion objects are independent of the textures exchanged with callers.
+    void resetConversionResources();
 
     void createYUVGLShader();
     void createYUVGLFullscreenQuad();

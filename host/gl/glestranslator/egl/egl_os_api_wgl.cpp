@@ -34,6 +34,7 @@
 
 #include "core_profile_configs.h"
 #include "common/gl_library.h"
+#include "common/lifetime_trace.h"
 #include "gfxstream/shared_library.h"
 #include "gfxstream/synchronization/Lock.h"
 #include "gfxstream/common/logging.h"
@@ -69,6 +70,9 @@ typedef GlLibrary::GlFunctionPointer GlFunctionPointer;
 // |extensionList| is a space-separated list of supported extension.
 // Returns true if the extension is supported, false otherwise.
 bool supportsExtension(const char* extension, const char* extensionList) {
+    if (!extension || !extensionList || !*extension || ::strchr(extension, ' ')) {
+        return false;
+    }
     size_t extensionLen = ::strlen(extension);
     const char* list = extensionList;
     for (;;) {
@@ -84,7 +88,7 @@ bool supportsExtension(const char* extension, const char* extensionList) {
             return true;
         }
         // otherwise, skip over the current position to find something else.
-        p += extensionLen;
+        list = p + extensionLen;
     }
 }
 
@@ -532,12 +536,63 @@ public:
         refreshDC();
     }
 
-    bool releaseDC() {
+    // Diagnostic only: identify the acquisition thread by both ID and birth time.
+    static unsigned long long threadBirth(const FILETIME& value) {
+        return (static_cast<unsigned long long>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
+    }
+
+    void tracePbufferBinding(const char* event) const {
+        if (!aemu_lifetime_trace::identityEventAllowed()) return;
+        int ownerStatus = 0; // 0 unknown, 1 same/live, 2 missing, 3 ID reused, 4 same/exited.
+        DWORD ownerError = 0;
+        if (m_dcOwnerThread && m_dcOwnerBirth) {
+            HANDLE owner = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, m_dcOwnerThread);
+            if (!owner) {
+                ownerError = GetLastError();
+                if (ownerError == ERROR_INVALID_PARAMETER) ownerStatus = 2;
+            } else {
+                FILETIME birth{}, exit{}, kernel{}, user{};
+                if (GetThreadTimes(owner, &birth, &exit, &kernel, &user)) {
+                    const DWORD ownerPid = GetProcessIdOfThread(owner);
+                    if (!ownerPid) {
+                        ownerError = GetLastError();
+                    } else if (threadBirth(birth) != m_dcOwnerBirth || ownerPid != GetCurrentProcessId()) {
+                        ownerStatus = 3;
+                    } else {
+                        const DWORD wait = WaitForSingleObject(owner, 0);
+                        if (wait == WAIT_TIMEOUT) ownerStatus = 1;
+                        else if (wait == WAIT_OBJECT_0) ownerStatus = 4;
+                        else ownerError = GetLastError();
+                    }
+                } else ownerError = GetLastError();
+                CloseHandle(owner);
+            }
+        }
+        const HDC currentDC = m_dispatch->wglGetCurrentDC();
+        const HGLRC currentContext = m_dispatch->wglGetCurrentContext();
+        const HDC readDC = m_dispatch->wglGetCurrentReadDC ? m_dispatch->wglGetCurrentReadDC() : nullptr;
+        std::fprintf(stderr, "AEMU_RESOURCE pbuffer_binding event=%s surface=%p handle=%p dc=%p owner_tid=%lu owner_birth=%llu calling_tid=%lu owner_status=%d owner_error=%lu current_dc=%p current_read_dc=%p current_context=%p read_available=%d\n",
+                     event, this, m_pb, m_hdc, static_cast<unsigned long>(m_dcOwnerThread), m_dcOwnerBirth,
+                     static_cast<unsigned long>(GetCurrentThreadId()), ownerStatus, static_cast<unsigned long>(ownerError),
+                     currentDC, readDC, currentContext, m_dispatch->wglGetCurrentReadDC != nullptr);
+        std::fflush(stderr);
+    }
+
+    bool releaseDC(DWORD* errorCode = nullptr) {
+        if (errorCode) *errorCode = 0;
         if (m_dcReleased) return true;
 
         bool res = false;
         if (m_dispatch->wglReleasePbufferDC) {
             res = m_dispatch->wglReleasePbufferDC(m_pb, m_hdc);
+            const DWORD error = res ? 0 : GetLastError();
+            if (errorCode) *errorCode = error;
+            if (aemu_lifetime_trace::identityEventAllowed()) {
+                std::fprintf(stderr, "AEMU_RESOURCE pbuffer_dc event=release surface=%p handle=%p dc=%p success=%d error=%lu\n",
+                             this, m_pb, m_hdc, res, static_cast<unsigned long>(error));
+                std::fflush(stderr);
+            }
+            tracePbufferBinding("release");
             m_hdc = 0;
             m_dcReleased = true;
         }
@@ -550,6 +605,19 @@ public:
             m_hdc = m_dispatch->wglGetPbufferDC(m_pb);
         }
 
+        const DWORD error = (!m_hdc && m_dispatch->wglGetPbufferDC) ? GetLastError() : 0;
+        if (m_hdc && aemu_lifetime_trace::enabled()) {
+            m_dcOwnerThread = GetCurrentThreadId();
+            FILETIME birth{}, exit{}, kernel{}, user{};
+            m_dcOwnerBirth = GetThreadTimes(GetCurrentThread(), &birth, &exit, &kernel, &user) ? threadBirth(birth) : 0;
+        }
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE pbuffer_dc event=refresh surface=%p handle=%p dc=%p success=%d error=%lu available=%d\n",
+                         this, m_pb, m_hdc, m_hdc != nullptr,
+                         static_cast<unsigned long>(error), m_dispatch->wglGetPbufferDC != nullptr);
+            std::fflush(stderr);
+        }
+        tracePbufferBinding("refresh");
         if (!m_hdc) return false;
 
         m_dcReleased = false;
@@ -583,6 +651,8 @@ public:
 private:
     bool        m_everMadeCurrent = false;
     bool        m_dcReleased = true;
+    DWORD       m_dcOwnerThread = 0;
+    unsigned long long m_dcOwnerBirth = 0;
     HWND        m_hwnd = nullptr;
     HPBUFFERARB m_pb = nullptr;
     HDC         m_hdc = nullptr;
@@ -595,13 +665,24 @@ static gfxstream::base::StaticLock sGlobalLock;
 class WinContext : public EglOS::Context {
 public:
     explicit WinContext(const WglExtensionsDispatch* dispatch, HGLRC ctx) :
-        mDispatch(dispatch), mCtx(ctx) {}
+        mDispatch(dispatch), mCtx(ctx) {
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE wgl_identity event=create object=%p handle=%p valid=%d\n", this, mCtx, mCtx != nullptr);
+            std::fflush(stderr);
+        }
+    }
 
     virtual ~WinContext() {
         gfxstream::base::AutoLock lock(sGlobalLock);
-        if (!mDispatch->wglDeleteContext(mCtx)) {
-            WGL_ERR("error deleting WGL context! error 0x%x\n",
-                    (unsigned)GetLastError());
+        const BOOL deleted = mDispatch->wglDeleteContext(mCtx);
+        const DWORD error = deleted ? 0 : GetLastError();
+        if (!deleted) {
+            WGL_ERR("error deleting WGL context! error 0x%x\n", (unsigned)error);
+        }
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE wgl_identity event=delete_issued object=%p handle=%p success=%d error=%lu\n",
+                         this, mCtx, deleted != FALSE, static_cast<unsigned long>(error));
+            std::fflush(stderr);
         }
     }
 
@@ -931,6 +1012,18 @@ public:
                WinGlobals* globals)
             : mDispatch(dispatch), mGlobals(globals) {}
 
+    ~WglDisplay() override {
+        gfxstream::base::AutoLock lock(sGlobalLock);
+        // Include quarantined refresh failures even if no later release drained them.
+        for (auto& pool : mFreePbufs) {
+            for (auto* surface : pool.second) destroyPbufferSurface(surface);
+        }
+        for (auto& pool : mLivePbufs) {
+            for (auto* surface : pool.second) destroyPbufferSurface(surface);
+        }
+        for (auto* surface : mDeletePbufs) destroyPbufferSurface(surface);
+    }
+
     virtual EglOS::GlesVersion getMaxGlesVersion() {
         if (!mCoreProfileSupported) {
             return EglOS::GlesVersion::ES2;
@@ -1047,6 +1140,9 @@ public:
             }
         }
 
+        if (!ctx) {
+            return nullptr;
+        }
         return std::make_shared<WinContext>(mDispatch, ctx);
     }
 
@@ -1075,23 +1171,38 @@ public:
             // the process at various times to create them one at a time.
             PROFILE_SLOW("createPbufferSurface (slow path)");
             int toCreate = std::max((int)mLivePbufs[pixelFormat].size(), kPbufPrimingCount);
+            tracePbufferPool("prime_begin", pixelFormat, nullptr, toCreate);
             for (int i = 0; i < toCreate; i++) {
-                freeElts.push_back(createPbufferSurfaceImpl(pixelFormat));
+                auto* surface = createPbufferSurfaceImpl(pixelFormat);
+                if (!surface) {
+                    // Keep successfully primed surfaces, but never publish a null entry.
+                    break;
+                }
+                freeElts.push_back(surface);
             }
+            tracePbufferPool("prime_end", pixelFormat, nullptr, toCreate);
         }
 
+        if (freeElts.empty()) {
+            return nullptr;
+        }
         PROFILE_SLOW("createPbufferSurface (fast path)");
         EglOS::Surface* surf = freeElts.back();
+        freeElts.pop_back();
         WinSurface* winSurface = WinSurface::from(surf);
         if (!winSurface->refreshDC()) {
             // TODO: Figure out why some Intel GPUs can hang flakily if
             // we just destroy the pbuffer here.
             mDeletePbufs.push_back(surf);
+            tracePbufferPool("refresh_failed", pixelFormat, surf);
             surf = createPbufferSurfaceImpl(pixelFormat);
         }
-        freeElts.pop_back();
+        if (!surf) {
+            return nullptr;
+        }
 
         mLivePbufs[pixelFormat].insert(surf);
+        tracePbufferPool("checkout", pixelFormat, surf);
 
         return surf;
     }
@@ -1102,7 +1213,30 @@ public:
 
         WinSurface* winpb = WinSurface::from(pb);
 
-        if (!winpb->releaseDC()) return false;
+        const HDC oldDC = winpb->getDC();
+        DWORD releaseError = 0;
+        if (!winpb->releaseDC(&releaseError)) {
+            tracePbufferPool("release_failed", winpb->getPixelFormat(), pb);
+            // The observed NTSTATUS maps locally to ERROR_DC_NOT_FOUND. Other
+            // errors are not evidence that the old DC is missing.
+            const bool missingDC = releaseError == ERROR_DC_NOT_FOUND ||
+                releaseError == static_cast<DWORD>(HRESULT_FROM_WIN32(ERROR_DC_NOT_FOUND)) ||
+                releaseError == 0xC0070591u;
+            if (!missingDC || !oldDC || !mDispatch->wglGetCurrentReadDC ||
+                oldDC == mDispatch->wglGetCurrentDC() ||
+                oldDC == mDispatch->wglGetCurrentReadDC()) {
+                tracePbufferPool("recovery_blocked", winpb->getPixelFormat(), pb);
+                return false;
+            }
+            // The original release path already marked its DC reference released.
+            // Acquire exactly one fresh reference and release that reference once.
+            // Never force an unbind, drop a surface, or report a failed call as success.
+            if (!winpb->refreshDC() || !winpb->releaseDC()) {
+                tracePbufferPool("recovery_failed", winpb->getPixelFormat(), pb);
+                return false;
+            }
+            tracePbufferPool("release_recovered", winpb->getPixelFormat(), pb);
+        }
 
         const EglOS::PixelFormat* pixelFormat =
             winpb->getPixelFormat();
@@ -1113,12 +1247,11 @@ public:
         mLivePbufs[pixelFormat].erase(pb);
 
         for (auto surf : mDeletePbufs) {
-            WinSurface* winSurface = WinSurface::from(surf);
-            mDispatch->wglDestroyPbuffer(winSurface->getPbuffer());
-            delete winSurface;
+            destroyPbufferSurface(surf);
         }
 
         mDeletePbufs.clear();
+        tracePbufferPool("release", pixelFormat, pb);
 
         return true;
     }
@@ -1154,16 +1287,15 @@ public:
             //
 
             int count = 100;
-            while (!dispatch->wglMakeCurrent(hdcDraw, hdcContext)
+            while (!(ret = dispatch->wglMakeCurrent(hdcDraw, hdcContext))
                    && --count > 0
                    && !GetLastError()) {
                 Sleep(16);
             }
-            if (count <= 0) {
+            if (!ret) {
                 D("Error: wglMakeCurrent() failed, error %d\n", (int)GetLastError());
                 return false;
             }
-            ret = true;
         } else if (!dispatch->wglMakeContextCurrent) {
             return false;
         } else {
@@ -1220,6 +1352,36 @@ private:
         }
     }
 
+    // Called under the existing display lock. Observes pools without inserting keys.
+    void tracePbufferPool(const char* event, const EglOS::PixelFormat* pixelFormat,
+                          EglOS::Surface* surface, int batch = 0) const {
+        if (!aemu_lifetime_trace::identityEventAllowed()) return;
+        const auto frees = mFreePbufs.find(pixelFormat);
+        const auto live = mLivePbufs.find(pixelFormat);
+        const WinPixelFormat* format = WinPixelFormat::from(pixelFormat);
+        std::fprintf(stderr, "AEMU_RESOURCE pbuffer_pool event=%s display=%p format=%p config=%d surface=%p free=%zu live=%zu pending=%zu batch=%d\n",
+                     event, this, pixelFormat, format->configId(), surface,
+                     frees == mFreePbufs.end() ? size_t(0) : frees->second.size(),
+                     live == mLivePbufs.end() ? size_t(0) : live->second.size(),
+                     mDeletePbufs.size(), batch);
+        std::fflush(stderr);
+    }
+
+    void destroyPbufferSurface(EglOS::Surface* surface) {
+        if (!surface) return;
+        WinSurface* winSurface = WinSurface::from(surface);
+        winSurface->releaseDC();
+        const BOOL destroyed = mDispatch->wglDestroyPbuffer(winSurface->getPbuffer());
+        const DWORD error = destroyed ? 0 : GetLastError();
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE pbuffer_identity event=delete_issued display=%p surface=%p handle=%p success=%d error=%lu\n",
+                         this, surface, winSurface->getPbuffer(), destroyed != FALSE,
+                         static_cast<unsigned long>(error));
+            std::fflush(stderr);
+        }
+        delete winSurface;
+    }
+
     EglOS::Surface* createPbufferSurfaceImpl(const EglOS::PixelFormat* pixelFormat) {
         // we never care about width or height, since we just use
         // opengl fbos anyway.
@@ -1227,15 +1389,35 @@ private:
         HDC dpy = mGlobals->getDummyDC(format);
 
         const WglExtensionsDispatch* dispatch = mDispatch;
-        if (!dispatch->wglCreatePbuffer) {
+        if (!dpy || !dispatch->wglCreatePbuffer || !dispatch->wglGetPbufferDC ||
+            !dispatch->wglReleasePbufferDC || !dispatch->wglDestroyPbuffer) {
+            tracePbufferPool("create_unavailable", pixelFormat, nullptr);
             return NULL;
         }
         HPBUFFERARB pb = dispatch->wglCreatePbuffer(dpy, format->configId(), 1, 1, nullptr);
         if (!pb) {
-            GetLastError();
+            const DWORD error = GetLastError();
+            if (aemu_lifetime_trace::identityEventAllowed()) {
+                std::fprintf(stderr, "AEMU_RESOURCE pbuffer_identity event=create_failed display=%p format=%p config=%d error=%lu\n",
+                             this, pixelFormat, format->configId(), static_cast<unsigned long>(error));
+                std::fflush(stderr);
+            }
             return NULL;
         }
-        return new WinSurface(pb, pixelFormat, dispatch);
+        auto* surface = new WinSurface(pb, pixelFormat, dispatch);
+        if (!surface->getDC()) {
+            // No DC was acquired: destroy the native pbuffer before dropping its wrapper.
+            dispatch->wglDestroyPbuffer(pb);
+            delete surface;
+            tracePbufferPool("create_dc_failed", pixelFormat, nullptr);
+            return nullptr;
+        }
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE pbuffer_identity event=create display=%p surface=%p handle=%p format=%p config=%d\n",
+                         this, surface, pb, pixelFormat, format->configId());
+            std::fflush(stderr);
+        }
+        return surface;
     }
 
     bool mCoreProfileSupported = false;

@@ -456,6 +456,12 @@ intptr_t RenderThread::main() {
             if (!tInfo->m_puid) {
                 tInfo->m_puid = mContextId;
             }
+#if GFXSTREAM_ENABLE_HOST_GLES
+            // GL ownership must follow the virtio context ID, just like Vulkan.
+            if (tInfo->m_glInfo && tInfo->m_puid && tInfo->m_puid != INVALID_CONTEXT_ID) {
+                tInfo->m_glInfo->m_puid = tInfo->m_puid;
+            }
+#endif
 
             if (!processResources && tInfo->m_puid && tInfo->m_puid != INVALID_CONTEXT_ID) {
                 processResources = FrameBuffer::getFB()->getProcessResources(tInfo->m_puid);

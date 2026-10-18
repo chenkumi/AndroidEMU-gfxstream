@@ -19,6 +19,7 @@
 #include <assert.h>
 
 #include "common/gles_context.h"
+#include "common/lifetime_trace.h"
 #include "common/translator_ifaces.h"
 #include "gfxstream/containers/Lookup.h"
 #include "gfxstream/files/PathUtils.h"
@@ -30,6 +31,7 @@ NameSpace::NameSpace(NamedObjectType p_type, GlobalNameSpace *globalNameSpace,
         gfxstream::Stream* stream, const ObjectData::loadObject_t& loadObject) :
     m_type(p_type),
     m_globalNameSpace(globalNameSpace) {
+    aemu_lifetime_trace::created(aemu_lifetime_trace::kNameSpace);
     if (!stream) return;
     // When loading from a snapshot, we restores translator states here, but
     // host GPU states are not touched until postLoadRestore is called.
@@ -60,6 +62,30 @@ NameSpace::NameSpace(NamedObjectType p_type, GlobalNameSpace *globalNameSpace,
 }
 
 NameSpace::~NameSpace() {
+    if (m_type == NamedObjectType::SHADER_OR_PROGRAM && aemu_lifetime_trace::enabled()) {
+        m_localToGlobalMap.forEachLive_const([&](bool, auto, auto, const NamedObjectPtr& object) {
+            if (object && aemu_lifetime_trace::identityEventAllowed()) {
+                std::fprintf(stderr, "AEMU_RESOURCE namespace_identity event=retire_object namespace=%p object=%p global=%u references=%ld\n",
+                             this, object.get(), object->getGlobalName(), object.use_count());
+                std::fflush(stderr);
+            }
+        });
+        if (aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE namespace_identity event=retire namespace=%p\n", this);
+            std::fflush(stderr);
+        }
+    }
+    static std::atomic<unsigned> tracedNamespaces{0};
+    if (aemu_lifetime_trace::enabled() && tracedNamespaces.fetch_add(1, std::memory_order_relaxed) < 2048) {
+        size_t names = 0, shared = 0;
+        m_localToGlobalMap.forEachLive_const([&](bool, auto, auto, const NamedObjectPtr& object) {
+            if (object) { ++names; if (object.use_count() > 1) ++shared; }
+        });
+        std::fprintf(stderr, "AEMU_RESOURCE namespace_destroy owner=%p type=%d names=%zu shared_names=%zu object_data=%zu\n",
+                     this, static_cast<int>(m_type), names, shared, m_objectDataMap.size());
+        std::fflush(stderr);
+    }
+    aemu_lifetime_trace::destroyed(aemu_lifetime_trace::kNameSpace);
 }
 
 void NameSpace::postLoad(const ObjectData::getObjDataPtr_t& getObjDataPtr) {
@@ -169,6 +195,11 @@ NameSpace::genName(GenNameInfo genNameInfo, ObjectLocalName p_localName, bool ge
 
     unsigned int globalName = newObjPtr->getGlobalName();
     m_globalToLocalMap.add(globalName, localName);
+    if (m_type == NamedObjectType::SHADER_OR_PROGRAM && aemu_lifetime_trace::identityEventAllowed()) {
+        std::fprintf(stderr, "AEMU_RESOURCE namespace_identity event=add namespace=%p object=%p local=%llu global=%u\n",
+                     this, newObjPtr.get(), static_cast<unsigned long long>(localName), globalName);
+        std::fflush(stderr);
+    }
     return localName;
 }
 
@@ -208,6 +239,11 @@ NameSpace::deleteName(ObjectLocalName p_localName)
     auto objPtrPtr = m_localToGlobalMap.getExceptZero(p_localName);
     if (objPtrPtr) {
         m_globalToLocalMap.remove((*objPtrPtr)->getGlobalName());
+        if (m_type == NamedObjectType::SHADER_OR_PROGRAM && aemu_lifetime_trace::identityEventAllowed()) {
+            std::fprintf(stderr, "AEMU_RESOURCE namespace_identity event=remove namespace=%p object=%p local=%llu global=%u\n",
+                         this, objPtrPtr->get(), static_cast<unsigned long long>(p_localName), (*objPtrPtr)->getGlobalName());
+            std::fflush(stderr);
+        }
         *objPtrPtr = *nullNamedObject;
         m_localToGlobalMap.remove(p_localName);
     }

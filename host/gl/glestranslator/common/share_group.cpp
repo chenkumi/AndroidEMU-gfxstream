@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "common/framebuffer_data.h"
+#include "common/lifetime_trace.h"
 #include "gfxstream/containers/Lookup.h"
 #include "gfxstream/synchronization/Lock.h"
 #include "gfxstream/common/logging.h"
@@ -66,6 +67,14 @@ ShareGroup::ShareGroup(GlobalNameSpace *globalNameSpace,
                             this, i);
             ++i;
         }
+    }
+    aemu_lifetime_trace::created(aemu_lifetime_trace::kShareGroup);
+    aemu_lifetime_trace::snapshot("share_group_created", this);
+    if (aemu_lifetime_trace::identityEventAllowed()) {
+        std::fprintf(stderr, "AEMU_RESOURCE namespace_identity event=owner namespace=%p group=%p group_id=%llu\n",
+                     m_nameSpace[toIndex(NamedObjectType::SHADER_OR_PROGRAM)], this,
+                     static_cast<unsigned long long>(m_sharedGroupID));
+        std::fflush(stderr);
     }
 }
 
@@ -143,6 +152,7 @@ void ShareGroup::unlockObjectData() {
 
 ShareGroup::~ShareGroup()
 {
+    aemu_lifetime_trace::snapshot("share_group_destroy_begin", this);
     {
         gfxstream::base::AutoLock lock(m_namespaceLock);
         ObjectDataAutoLock objDataLock(this);
@@ -150,6 +160,8 @@ ShareGroup::~ShareGroup()
             delete n;
         }
     }
+    aemu_lifetime_trace::destroyed(aemu_lifetime_trace::kShareGroup);
+    aemu_lifetime_trace::snapshot("share_group_destroy_done", this);
 }
 
 ObjectLocalName

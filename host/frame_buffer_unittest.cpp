@@ -37,6 +37,8 @@
 #include "gfxstream/system/System.h"
 #include "render_channel_impl.h"
 #include "render_thread_info.h"
+#include "render_control.h"
+#include "host/gl/emulation_gl.h"
 
 #ifdef _MSC_VER
 #include "gfxstream/msvc.h"
@@ -384,6 +386,45 @@ TEST_F(FrameBufferTest, Configs) {
 TEST_F(FrameBufferTest, CreateEmulatedEglContext) {
     HandleType handle = mFb->createEmulatedEglContext(0, 0, GLESApi_3_0);
     EXPECT_NE((HandleType)0, handle);
+}
+
+TEST_F(FrameBufferTest, LegacyContextReleasedOnThreadDrain) {
+    auto* emulation = mFb->getEmulationGl();
+    ASSERT_EQ(0u, mRenderThreadInfo->m_glInfo->m_puid);
+    HandleType handle = mFb->createEmulatedEglContext(0, 0, GLESApi_3_0);
+    ASSERT_NE(0u, handle);
+    ASSERT_NE(nullptr, emulation->getContext(handle));
+    mFb->drainGlRenderThreadResources();
+    EXPECT_EQ(nullptr, emulation->getContext(handle));
+}
+
+TEST_F(FrameBufferTest, RenderControlPuidTracksGlOwnership) {
+    initRenderControlContext(&mRenderThreadInfo->m_rcDec);
+    mRenderThreadInfo->m_rcDec.rcSetPuid(42);
+    EXPECT_EQ(42u, mRenderThreadInfo->m_puid);
+    EXPECT_EQ(42u, mRenderThreadInfo->m_glInfo->m_puid);
+    // Virtio's invalid pipe ID must not replace an established process owner.
+    mRenderThreadInfo->m_rcDec.rcSetPuid(~uint64_t(0));
+    EXPECT_EQ(42u, mRenderThreadInfo->m_puid);
+    EXPECT_EQ(42u, mRenderThreadInfo->m_glInfo->m_puid);
+}
+
+TEST_F(FrameBufferTest, ProcessCleanupPreservesOtherSharedContext) {
+    auto* emulation = mFb->getEmulationGl();
+    initRenderControlContext(&mRenderThreadInfo->m_rcDec);
+    mRenderThreadInfo->m_rcDec.rcSetPuid(42);
+    HandleType first = mFb->createEmulatedEglContext(0, 0, GLESApi_3_0);
+    ASSERT_NE(0u, first);
+    mRenderThreadInfo->m_rcDec.rcSetPuid(84);
+    HandleType second = mFb->createEmulatedEglContext(0, first, GLESApi_3_0);
+    ASSERT_NE(0u, second);
+    // The cleanup caller is a neutral host thread, not a live thread owned by either app.
+    mRenderThreadInfo->m_rcDec.rcSetPuid(0);
+    mFb->cleanupProcGLObjects(42);
+    EXPECT_EQ(nullptr, emulation->getContext(first));
+    EXPECT_NE(nullptr, emulation->getContext(second));
+    mFb->cleanupProcGLObjects(84);
+    EXPECT_EQ(nullptr, emulation->getContext(second));
 }
 
 // Tests creating window surface from FrameBuffer.

@@ -17,6 +17,7 @@
 #include "frame_buffer.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__linux__)
 #include <sys/resource.h>
@@ -24,6 +25,7 @@
 #include <time.h>
 
 #include <iomanip>
+#include <atomic>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -2363,6 +2365,13 @@ std::unique_ptr<ProcessResources> FrameBuffer::Impl::removeGraphicsProcessResour
 
 void FrameBuffer::Impl::cleanupProcGLObjects(uint64_t puid) {
     bool renderThreadWithThisPuidExists = false;
+    const char* traceEnv = getenv("AEMU_RESOURCE_TRACE");
+    const bool trace = traceEnv && !strcmp(traceEnv, "1");
+    unsigned waitIterations = 0;
+    if (trace) {
+        fprintf(stderr, "AEMU_RESOURCE cleanup_begin puid=%llu\n", (unsigned long long)puid);
+        fflush(stderr);
+    }
 
     do {
         renderThreadWithThisPuidExists = false;
@@ -2373,6 +2382,13 @@ void FrameBuffer::Impl::cleanupProcGLObjects(uint64_t puid) {
             }
         });
         gfxstream::base::sleepUs(10000);
+        ++waitIterations;
+        if (trace && renderThreadWithThisPuidExists && waitIterations % 500 == 0 &&
+            waitIterations <= 3000) {
+            fprintf(stderr, "AEMU_RESOURCE cleanup_wait puid=%llu iterations=%u\n",
+                    (unsigned long long)puid, waitIterations);
+            fflush(stderr);
+        }
     } while (renderThreadWithThisPuidExists);
 
 
@@ -2399,11 +2415,42 @@ void FrameBuffer::Impl::cleanupProcGLObjects(uint64_t puid) {
     for (auto cb : callbacks) {
         cb();
     }
+    if (trace) {
+        fprintf(stderr, "AEMU_RESOURCE cleanup_done puid=%llu iterations=%u callbacks=%zu\n",
+                (unsigned long long)puid, waitIterations, callbacks.size());
+        fflush(stderr);
+    }
 }
 
 std::vector<HandleType> FrameBuffer::Impl::cleanupProcGLObjects_locked(uint64_t puid, bool forced)
     NO_THREAD_SAFETY_ANALYSIS {
     std::vector<HandleType> colorBuffersToCleanup;
+    // Called under m_lock. Observation only; do not close or acquire extra buffer references.
+    const auto traceBuffers = [this, puid](const char* phase) {
+        const char* setting = getenv("AEMU_RESOURCE_TRACE");
+        if (!setting || strcmp(setting, "1")) return;
+        static std::atomic<unsigned> emitted{0};
+        if (emitted.fetch_add(1, std::memory_order_relaxed) >= 2048) return;
+        AutoLock colorBufferMapLock(m_colorBufferMapLock);
+        size_t zeroReferences = 0, unopened = 0;
+        uint64_t pixelCount = 0;
+        for (const auto& entry : m_colorbuffers) {
+            zeroReferences += entry.second.refcount == 0;
+            unopened += !entry.second.opened;
+            if (entry.second.cb) {
+                pixelCount += uint64_t(entry.second.cb->getWidth()) * entry.second.cb->getHeight();
+            }
+        }
+        const auto owned = m_procOwnedColorBuffers.find(puid);
+        const size_t ownedRefs = owned == m_procOwnedColorBuffers.end() ? 0 : owned->second.size();
+        fprintf(stderr, "AEMU_RESOURCE color_buffers phase=%s puid=%llu live=%zu pixels=%llu zero_refs=%zu unopened=%zu delayed=%zu owned_refs=%zu guest_managed=%d refcount_pipe=%d buffers=%zu\n",
+                phase, (unsigned long long)puid, m_colorbuffers.size(),
+                (unsigned long long)pixelCount, zeroReferences, unopened,
+                m_colorBufferDelayedCloseList.size(), ownedRefs,
+                (int)m_guestManagedColorBufferLifetime, (int)m_refCountPipeEnabled, m_buffers.size());
+        fflush(stderr);
+    };
+    traceBuffers("before_cleanup");
     {
         std::unique_ptr<RecursiveScopedContextBind> bind = nullptr;
 #if GFXSTREAM_ENABLE_HOST_GLES
@@ -2448,6 +2495,7 @@ std::vector<HandleType> FrameBuffer::Impl::cleanupProcGLObjects_locked(uint64_t 
         }
     }
 
+    traceBuffers("after_cleanup");
     return colorBuffersToCleanup;
 }
 

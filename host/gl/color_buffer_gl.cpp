@@ -19,6 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -38,6 +42,32 @@ namespace gl {
 namespace {
 
 using gfxstream::base::ManagedDescriptor;
+
+// Diagnostic only: observe existing calls without reading or clearing GL errors.
+void traceColorBufferDestruction(const char* event, const void* object,
+        uint32_t handle, uint32_t width, uint32_t height, GLuint texture,
+        GLuint blitTexture, GLuint framebuffer, EGLImageKHR image,
+        EGLImageKHR blitImage, GLuint memoryObject, const void* helper) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("AEMU_COLORBUFFER_TRACE");
+        return value && !std::strcmp(value, "1");
+    }();
+    if (!enabled) return;
+    static std::atomic<unsigned> emitted{0};
+    const unsigned sequence = emitted.fetch_add(1, std::memory_order_relaxed);
+    if (sequence >= 8192) {
+        if (sequence == 8192) {
+            std::fprintf(stderr, "AEMU_COLORBUFFER limit_reached budget=8192\n");
+            std::fflush(stderr);
+        }
+        return;
+    }
+    std::fprintf(stderr, "AEMU_COLORBUFFER event=%s seq=%u object=%p handle=%u width=%u height=%u texture=%u blit_texture=%u framebuffer=%u image=%p blit_image=%p memory_object=%u helper=%p\n",
+                 event, sequence, object, handle, width, height, texture,
+                 blitTexture, framebuffer, image, blitImage, memoryObject, helper);
+    std::fflush(stderr);
+}
+
 
 // Lazily create and bind a framebuffer object to the current host context.
 // |fbo| is the address of the framebuffer object name.
@@ -424,23 +454,37 @@ ColorBufferGl::ColorBufferGl(EGLDisplay display, HandleType hndl, GLuint width, 
       m_helper(helper),
       m_textureDraw(textureDraw),
       m_pixelReadFormats(pixelReadFormats),
-      mHndl(hndl) {}
+      mHndl(hndl) {
+    traceColorBufferDestruction("construct", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
+}
 
 ColorBufferGl::~ColorBufferGl() {
+    traceColorBufferDestruction("destroy_begin", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
     RecursiveScopedContextBind context(m_helper);
 
     // b/284523053
     // Swiftshader logspam on exit. But it doesn't happen with SwANGLE.
     if (!context.isOk()) {
+        traceColorBufferDestruction("destroy_bind_failed", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
         GFXSTREAM_DEBUG("Failed to bind context when releasing color buffers\n");
         return;
     }
 
+    traceColorBufferDestruction("destroy_bound", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
+
     if (m_blitEGLImage) {
-        s_egl.eglDestroyImageKHR(m_display, m_blitEGLImage);
+        const EGLBoolean destroyed = s_egl.eglDestroyImageKHR(m_display, m_blitEGLImage);
+        traceColorBufferDestruction(destroyed ? "blit_image_destroy_true" : "blit_image_destroy_false", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
     }
     if (m_eglImage) {
-        s_egl.eglDestroyImageKHR(m_display, m_eglImage);
+        const EGLBoolean destroyed = s_egl.eglDestroyImageKHR(m_display, m_eglImage);
+        traceColorBufferDestruction(destroyed ? "image_destroy_true" : "image_destroy_false", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
     }
 
     if (m_fbo) {
@@ -459,12 +503,16 @@ ColorBufferGl::~ColorBufferGl() {
 
     GLuint tex[2] = {m_tex, m_blitTex};
     s_gles2.glDeleteTextures(2, tex);
+    traceColorBufferDestruction("textures_delete_issued", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
 
     if (m_memoryObject) {
         s_gles2.glDeleteMemoryObjectsEXT(1, &m_memoryObject);
     }
 
     delete m_resizer;
+    traceColorBufferDestruction("destroy_end", this, mHndl, m_width, m_height,
+        m_tex, m_blitTex, m_fbo, m_eglImage, m_blitEGLImage, m_memoryObject, m_helper);
 }
 
 
