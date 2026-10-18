@@ -15,40 +15,11 @@
 */
 
 #include "common/named_object.h"
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 
 #include "common/gles_context.h"
 #include "common/object_name_space.h"
 #include "common/lifetime_trace.h"
 #include "gfxstream/synchronization/Lock.h"
-
-
-// Diagnostic only: does not add a shared_ptr or query/modify GL state.
-namespace {
-void traceNativeTexture(const char* event, const void* object,
-                        const void* globalNamespace, unsigned globalName) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("AEMU_NATIVE_TEXTURE_TRACE");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    if (!enabled) return;
-    static std::atomic<unsigned> next{0};
-    const unsigned sequence = next.fetch_add(1, std::memory_order_relaxed);
-    if (sequence >= 16384) {
-        if (sequence == 16384) {
-            std::fputs("AEMU_NATIVE_TEXTURE limit_reached budget=16384\n", stderr);
-            std::fflush(stderr);
-        }
-        return;
-    }
-    std::fprintf(stderr, "AEMU_NATIVE_TEXTURE event=%s seq=%u object=%p namespace=%p global=%u\n",
-                 event, sequence, object, globalNamespace, globalName);
-    std::fflush(stderr);
-}
-}  // namespace
 
 NamedObject::NamedObject(GenNameInfo genNameInfo,
                          GlobalNameSpace *globalNameSpace) {
@@ -111,9 +82,6 @@ NamedObject::NamedObject(GenNameInfo genNameInfo,
                 m_globalName = 0;
         }
     }
-    if (m_type == NamedObjectType::TEXTURE) {
-        traceNativeTexture("create", this, m_globalNameSpace, m_globalName);
-    }
     if (m_globalName) aemu_lifetime_trace::created(static_cast<int>(m_type));
     if (m_type == NamedObjectType::SHADER_OR_PROGRAM && aemu_lifetime_trace::identityEventAllowed()) {
         std::fprintf(stderr, "AEMU_RESOURCE named_identity event=create object=%p global=%u subtype=%d\n",
@@ -131,7 +99,6 @@ NamedObject::~NamedObject() {
         break;
     case NamedObjectType::TEXTURE:
         GLEScontext::dispatcher().glDeleteTextures(1, &m_globalName);
-        traceNativeTexture("delete_issued", this, m_globalNameSpace, m_globalName);
         break;
     case NamedObjectType::RENDERBUFFER:
         GLEScontext::dispatcher().glDeleteRenderbuffers(1, &m_globalName);

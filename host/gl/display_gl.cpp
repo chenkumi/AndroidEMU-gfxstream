@@ -28,13 +28,9 @@ namespace gl {
 namespace {
 
 std::shared_future<void> getCompletedFuture() {
-    // This is an already-completed CPU marker, not a GPU completion fence.
-    // Reuse its immutable shared state instead of allocating it on every post.
-    static const std::shared_future<void> completedFuture = [] {
-        auto future = std::async(std::launch::deferred, [] {}).share();
-        future.wait();
-        return future;
-    }();
+    std::shared_future<void> completedFuture =
+        std::async(std::launch::deferred, [] {}).share();
+    completedFuture.wait();
     return completedFuture;
 }
 

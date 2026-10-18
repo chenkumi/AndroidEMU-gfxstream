@@ -731,9 +731,6 @@ YUVConverter::YUVConverter(int width, int height, GfxstreamFormat format)
       mColorBufferFormat(format) {}
 
 void YUVConverter::init(int width, int height, GfxstreamFormat format) {
-    // Reinitialization must not overwrite live program/buffer names. Keep the
-    // textures: they may have just been exchanged with an external caller.
-    resetConversionResources();
     uint32_t yWidth, yHeight = 0, yOffsetBytes, yStridePixels = 0, yStrideBytes;
     uint32_t uWidth, uHeight = 0, uOffsetBytes, uStridePixels = 0, uStrideBytes;
     uint32_t vWidth, vHeight = 0, vOffsetBytes, vStridePixels = 0, vStrideBytes;
@@ -837,8 +834,8 @@ void YUVConverter::swapTextures(GfxstreamFormat format, GLuint* textures, void* 
     const bool needToUpdateConversionShader = checkAndUpdateColorAspectsChanged(metadata);
     if (needToUpdateConversionShader) {
         saveGLState();
+        reset();
         init(mWidth, mHeight, mFormat);
-        restoreGLState();
     }
 
     mTexturesSwapped = true;
@@ -949,17 +946,10 @@ void YUVConverter::updateCutoffs(float yWidth, float yStridePixels,
     }
 }
 
-void YUVConverter::resetConversionResources() {
+void YUVConverter::reset() {
     if (mQuadIndexBuffer) s_gles2.glDeleteBuffers(1, &mQuadIndexBuffer);
     if (mQuadVertexBuffer) s_gles2.glDeleteBuffers(1, &mQuadVertexBuffer);
     if (mProgram) s_gles2.glDeleteProgram(mProgram);
-    mQuadIndexBuffer = 0;
-    mQuadVertexBuffer = 0;
-    mProgram = 0;
-}
-
-void YUVConverter::reset() {
-    resetConversionResources();
     if (mTextureY) s_gles2.glDeleteTextures(1, &mTextureY);
     if (IsInterleavedChromaYuvFormat(mFormat)) {
         if (mTextureU) s_gles2.glDeleteTextures(1, &mTextureU);
@@ -967,6 +957,9 @@ void YUVConverter::reset() {
         if (mTextureU) s_gles2.glDeleteTextures(1, &mTextureU);
         if (mTextureV) s_gles2.glDeleteTextures(1, &mTextureV);
     }
+    mQuadIndexBuffer = 0;
+    mQuadVertexBuffer = 0;
+    mProgram = 0;
     mTextureY = 0;
     mTextureU = 0;
     mTextureV = 0;
